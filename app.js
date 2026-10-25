@@ -280,7 +280,26 @@ document.addEventListener('DOMContentLoaded', () => {
   renderApp();
   initStickyHeaderFilterDocking();
   lucide.createIcons();
+  initDeviceSync();
 });
+
+// Helper to get or construct a Google Maps URL for any place
+function getPlaceMapUrl(place) {
+  if (!place) return '';
+  if (place.mapUrl && typeof place.mapUrl === 'string' && place.mapUrl.trim()) {
+    return place.mapUrl.trim();
+  }
+  const lat = typeof place.lat === 'number' ? place.lat : parseFloat(place.lat);
+  const lng = typeof place.lng === 'number' ? place.lng : parseFloat(place.lng);
+  if (!isNaN(lat) && !isNaN(lng) && lat !== 0) {
+    return `https://www.google.com/maps/search/?api=1&query=${lat},${lng}`;
+  }
+  if (place.name) {
+    const q = place.name + (place.city ? ', ' + place.city : '') + (place.country ? ', ' + place.country : '');
+    return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(q)}`;
+  }
+  return '';
+}
 
 // Load places from localStorage or default to seed data
 function loadPlaces() {
@@ -334,16 +353,19 @@ function loadPlaces() {
       savePlacesToStorage();
     }
 
-    // Strip legacy price field, ensure neighbourhood, and sync real photos
+    // Strip legacy price field, ensure address & photos, and populate mapUrl
     state.places.forEach(p => {
       delete p.price;
-      p.address = 'North of main beach';
       const seed = SEED_PLACES.find(s => s.id === p.id);
-      if (seed && seed.photoUrl) {
-        p.photoUrl = seed.photoUrl;
-        p.mapUrl = seed.mapUrl;
-        p.lat = seed.lat;
-        p.lng = seed.lng;
+      if (seed) {
+        if (!p.address) p.address = seed.address || '';
+        if (seed.photoUrl && !p.photoUrl) p.photoUrl = seed.photoUrl;
+        if (seed.mapUrl && !p.mapUrl) p.mapUrl = seed.mapUrl;
+        if (seed.lat && (!p.lat || p.lat === 0)) p.lat = seed.lat;
+        if (seed.lng && (!p.lng || p.lng === 0)) p.lng = seed.lng;
+      }
+      if (!p.mapUrl) {
+        p.mapUrl = getPlaceMapUrl(p);
       }
     });
     savePlacesToStorage();
@@ -353,12 +375,338 @@ function loadPlaces() {
   }
 }
 
-function savePlacesToStorage() {
+function savePlacesToStorage(skipSync = false) {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state.places));
+    if (!skipSync && typeof triggerSyncPush === 'function') {
+      triggerSyncPush();
+    }
   } catch (err) {
     console.error('Error saving to localStorage:', err);
   }
+}
+
+// ========================================================
+// REAL-TIME CROSS-DEVICE SYNC MANAGER
+// ========================================================
+const SYNC_STORAGE_KEY = 'travelpins_sync_vault';
+let syncDebounceTimer = null;
+let syncPollInterval = null;
+let syncState = {
+  isLocal: false,
+  status: 'offline', // 'online' | 'syncing' | 'offline'
+  vaultCode: '',
+  vaultUri: '',
+  lastSynced: 0
+};
+
+function isLocalSyncServer() {
+  if (typeof window === 'undefined') return false;
+  const host = window.location.hostname;
+  return host === 'localhost' || host === '127.0.0.1' || /^192\.168\./.test(host) || /^10\./.test(host) || window.location.port === '3333';
+}
+
+function getSyncPairingUrl(vaultKey) {
+  const base = window.location.origin + window.location.pathname;
+  return `${base}?sync=${encodeURIComponent(vaultKey || '')}`;
+}
+
+function updateSyncUI() {
+  const dot = document.getElementById('headerSyncDot');
+  const label = document.getElementById('syncHeaderBtnLabel');
+  const modalDot = document.getElementById('syncModalStatusDot');
+  const modalText = document.getElementById('syncModalStatusText');
+  const modalBadge = document.getElementById('syncModalVaultBadge');
+  const lastSyncedEl = document.getElementById('syncModalLastSynced');
+  const pairUrlInput = document.getElementById('syncPairUrlInput');
+  const qrImg = document.getElementById('syncQrCodeImg');
+
+  const statusClass = syncState.status === 'syncing' ? 'syncing' : (syncState.status === 'online' ? 'online' : 'offline');
+  if (dot) dot.className = `sync-status-dot ${statusClass}`;
+  if (modalDot) modalDot.className = `sync-status-dot ${statusClass}`;
+
+  if (label) {
+    if (syncState.status === 'syncing') {
+      label.textContent = 'Syncing...';
+    } else if (syncState.isLocal) {
+      label.textContent = 'Local Wi-Fi';
+    } else if (syncState.vaultUri) {
+      label.textContent = 'Synced';
+    } else {
+      label.textContent = 'Pair';
+    }
+  }
+
+  if (modalText) {
+    if (syncState.status === 'syncing') {
+      modalText.textContent = 'Syncing spots...';
+    } else if (syncState.isLocal) {
+      modalText.textContent = 'Local Wi-Fi Sync Active';
+    } else if (syncState.vaultUri) {
+      modalText.textContent = 'Cloud Sync Active';
+    } else {
+      modalText.textContent = 'Ready to Pair';
+    }
+  }
+
+  if (modalBadge) {
+    modalBadge.textContent = syncState.isLocal ? 'Wi-Fi: LAN' : `Vault: ${syncState.vaultCode || '...'}`;
+  }
+
+  if (lastSyncedEl) {
+    if (!syncState.lastSynced) {
+      lastSyncedEl.textContent = 'Last synced: Not yet';
+    } else {
+      const diffSec = Math.floor((Date.now() - syncState.lastSynced) / 1000);
+      if (diffSec < 5) lastSyncedEl.textContent = 'Last synced: Just now';
+      else if (diffSec < 60) lastSyncedEl.textContent = `Last synced: ${diffSec}s ago`;
+      else lastSyncedEl.textContent = `Last synced: ${Math.floor(diffSec / 60)}m ago`;
+    }
+  }
+
+  const pairKey = syncState.vaultUri
+    ? syncState.vaultUri.replace('https://api.jsonstorage.net/v1/json/', '').replace(/\//g, '_')
+    : (syncState.vaultCode || 'local-lan');
+
+  const pairUrl = getSyncPairingUrl(pairKey);
+  if (pairUrlInput && pairUrlInput.value !== pairUrl) {
+    pairUrlInput.value = pairUrl;
+  }
+  if (qrImg && pairKey) {
+    const qrSrc = `https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=${encodeURIComponent(pairUrl)}`;
+    if (qrImg.getAttribute('src') !== qrSrc) {
+      qrImg.setAttribute('src', qrSrc);
+    }
+  }
+}
+
+async function initDeviceSync() {
+  syncState.isLocal = isLocalSyncServer();
+
+  // 1. Check if user opened app via a pairing link (?sync=...)
+  const urlParams = new URLSearchParams(window.location.search);
+  const syncParam = urlParams.get('sync');
+
+  if (syncParam) {
+    // Clean URL query without page reload
+    const cleanUrl = window.location.origin + window.location.pathname;
+    window.history.replaceState({}, document.title, cleanUrl);
+
+    if (syncParam !== 'local-lan') {
+      const reconstructed = syncParam.replace(/_/g, '/');
+      const targetUri = reconstructed.startsWith('http')
+        ? reconstructed
+        : `https://api.jsonstorage.net/v1/json/${reconstructed}`;
+
+      syncState.vaultUri = targetUri;
+      syncState.vaultCode = targetUri.split('/').pop().substring(0, 8).toUpperCase();
+      syncState.isLocal = false;
+      saveSyncVault();
+      showToast('✨ Paired with your travel vault! Syncing spots...');
+      await pullFromSync(false);
+    }
+  } else {
+    // Load existing vault configuration from localStorage
+    try {
+      const saved = localStorage.getItem(SYNC_STORAGE_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        syncState.vaultCode = parsed.vaultCode || '';
+        syncState.vaultUri = parsed.vaultUri || '';
+        syncState.lastSynced = parsed.lastSynced || 0;
+      }
+    } catch (e) {}
+  }
+
+  // 2. Initial Sync
+  if (syncState.isLocal) {
+    syncState.status = 'online';
+    await pullFromSync(true);
+    if (state.places && state.places.length > 0) {
+      triggerSyncPush(true);
+    }
+  } else if (syncState.vaultUri) {
+    syncState.status = 'online';
+    await pullFromSync(true);
+  } else {
+    // Auto-create cloud vault for instant out-of-the-box pairing
+    createCloudVault();
+  }
+
+  updateSyncUI();
+
+  // 3. Setup background polling loop (every 4 seconds)
+  if (syncPollInterval) clearInterval(syncPollInterval);
+  syncPollInterval = setInterval(() => {
+    pullFromSync(true);
+  }, 4000);
+
+  // 4. Setup instant sync on visibility change (switching back to tab or unlocking mobile)
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      pullFromSync(true);
+    }
+  });
+
+  window.addEventListener('online', () => {
+    showToast('🌐 Network reconnected. Syncing spots...');
+    triggerSyncPush(true);
+    pullFromSync(true);
+  });
+}
+
+function saveSyncVault() {
+  try {
+    localStorage.setItem(SYNC_STORAGE_KEY, JSON.stringify({
+      vaultCode: syncState.vaultCode,
+      vaultUri: syncState.vaultUri,
+      lastSynced: syncState.lastSynced
+    }));
+  } catch (e) {}
+}
+
+async function createCloudVault() {
+  const code = 'TRV-' + Math.random().toString(36).substring(2, 6).toUpperCase();
+  syncState.vaultCode = code;
+  syncState.status = 'syncing';
+  updateSyncUI();
+
+  try {
+    const res = await fetch('https://api.jsonstorage.net/v1/json', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        vaultCode: code,
+        places: state.places,
+        updatedAt: Date.now()
+      })
+    });
+    if (res.ok) {
+      const data = await res.json();
+      if (data && data.uri) {
+        syncState.vaultUri = data.uri;
+        syncState.lastSynced = Date.now();
+        syncState.status = 'online';
+        saveSyncVault();
+        updateSyncUI();
+      }
+    }
+  } catch (e) {
+    syncState.status = 'offline';
+    updateSyncUI();
+  }
+}
+
+function triggerSyncPush(immediate = false) {
+  if (syncDebounceTimer) clearTimeout(syncDebounceTimer);
+  if (immediate) {
+    pushToSync();
+  } else {
+    syncDebounceTimer = setTimeout(pushToSync, 400);
+  }
+}
+
+async function pushToSync() {
+  syncState.status = 'syncing';
+  updateSyncUI();
+
+  const nowMs = Date.now();
+  const payload = {
+    places: state.places,
+    updatedAt: nowMs
+  };
+
+  try {
+    if (syncState.isLocal) {
+      const res = await fetch('/api/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (res.ok) {
+        syncState.lastSynced = nowMs;
+        syncState.status = 'online';
+      } else {
+        syncState.status = 'offline';
+      }
+    } else if (syncState.vaultUri) {
+      const res = await fetch(syncState.vaultUri, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      if (res.ok) {
+        syncState.lastSynced = nowMs;
+        syncState.status = 'online';
+        saveSyncVault();
+      } else {
+        syncState.status = 'offline';
+      }
+    } else {
+      await createCloudVault();
+    }
+  } catch (e) {
+    syncState.status = 'offline';
+  }
+  updateSyncUI();
+}
+
+async function pullFromSync(silent = true) {
+  const fetchUrl = syncState.isLocal ? '/api/sync' : syncState.vaultUri;
+  if (!fetchUrl) return;
+
+  try {
+    const res = await fetch(fetchUrl, {
+      cache: 'no-store',
+      headers: { 'Cache-Control': 'no-cache' }
+    });
+
+    if (res.ok) {
+      const remote = await res.json();
+      if (remote && Array.isArray(remote.places)) {
+        const remoteUpdated = remote.updatedAt || 0;
+
+        if (remoteUpdated > (syncState.lastSynced + 500) && remote.places.length > 0) {
+          const currentJson = JSON.stringify(state.places);
+          const remoteJson = JSON.stringify(remote.places);
+
+          if (currentJson !== remoteJson) {
+            state.places = remote.places;
+            savePlacesToStorage(true);
+            renderApp();
+            syncState.lastSynced = remoteUpdated;
+            saveSyncVault();
+            if (!silent) {
+              showToast('☁️ Synced updates from your other device!');
+            }
+          }
+        }
+        syncState.status = 'online';
+      }
+    }
+  } catch (e) {
+    if (!silent) {
+      showToast('Could not reach sync server. Will retry automatically.');
+    }
+    syncState.status = 'offline';
+  }
+  updateSyncUI();
+}
+
+function openSyncModal() {
+  const modal = document.getElementById('syncModal');
+  if (!modal) return;
+  updateSyncUI();
+  modal.classList.remove('hidden');
+  onModalOpen();
+  if (window.lucide) lucide.createIcons();
+}
+
+function closeSyncModal() {
+  const modal = document.getElementById('syncModal');
+  if (!modal) return;
+  modal.classList.add('hidden');
+  onModalClose();
 }
 
 // ========================================================
@@ -571,9 +919,9 @@ function updateMapMarkers(filteredPlaces) {
           <!-- Action Bar: Google maps link & Actions -->
           <div class="card-footer">
             <div style="display: flex; align-items: center; gap: 0.5rem;">
-              ${place.mapUrl ? `
+              ${getPlaceMapUrl(place) ? `
                 <a 
-                  href="${escapeHtml(place.mapUrl)}" 
+                  href="${escapeHtml(getPlaceMapUrl(place))}" 
                   target="_blank" 
                   rel="noopener noreferrer" 
                   class="card-footer-btn"
@@ -1030,9 +1378,9 @@ function renderCards(places) {
         <!-- Action Bar: Google maps link & Card Actions -->
         <div class="card-footer">
           <div style="display: flex; align-items: center; gap: 0.5rem;">
-            ${place.mapUrl ? `
+            ${getPlaceMapUrl(place) ? `
               <a 
-                href="${escapeHtml(place.mapUrl)}" 
+                href="${escapeHtml(getPlaceMapUrl(place))}" 
                 target="_blank" 
                 rel="noopener noreferrer" 
                 class="card-footer-btn"
@@ -1355,11 +1703,70 @@ function setupEventListeners() {
     });
   }
 
-  // Google Maps URL Autofill Listener
+  // Google Maps URL Autofill & Cancel / Clear Listener
   const mapUrlInput = document.getElementById('formMapUrl');
+  const clearMapUrlBtn = document.getElementById('clearMapUrlBtn');
+
+  function updateClearMapBtn() {
+    if (clearMapUrlBtn && mapUrlInput) {
+      clearMapUrlBtn.classList.toggle('hidden', mapUrlInput.value.trim().length === 0);
+    }
+  }
+
+  function syncAutoMapUrlFromName() {
+    const mapInp = document.getElementById('formMapUrl');
+    const clrBtn = document.getElementById('clearMapUrlBtn');
+    if (!mapInp) return;
+    if (mapInp.dataset.manualCleared === 'true') return;
+    if (mapInp.value.trim() && mapInp.dataset.autogenerated !== 'true') return;
+
+    const nameVal = (document.getElementById('formName')?.value || '').trim();
+    const cityVal = (document.getElementById('formCity')?.value || '').trim();
+    if (nameVal) {
+      mapInp.value = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(nameVal + (cityVal ? ', ' + cityVal : ''))}`;
+      mapInp.dataset.autogenerated = 'true';
+      if (clrBtn) clrBtn.classList.remove('hidden');
+    } else if (mapInp.dataset.autogenerated === 'true') {
+      mapInp.value = '';
+      mapInp.dataset.autogenerated = 'false';
+      if (clrBtn) clrBtn.classList.add('hidden');
+    }
+  }
+
+  const nameInputEl = document.getElementById('formName');
+  if (nameInputEl) nameInputEl.addEventListener('input', syncAutoMapUrlFromName);
+  const cityInputEl = document.getElementById('formCity');
+  if (cityInputEl) cityInputEl.addEventListener('input', syncAutoMapUrlFromName);
+
   if (mapUrlInput) {
-    mapUrlInput.addEventListener('input', handleMapUrlAutofill);
-    mapUrlInput.addEventListener('paste', () => setTimeout(handleMapUrlAutofill, 80));
+    mapUrlInput.addEventListener('input', () => {
+      mapUrlInput.dataset.autogenerated = 'false';
+      mapUrlInput.dataset.manualCleared = 'false';
+      updateClearMapBtn();
+      handleMapUrlAutofill();
+    });
+    mapUrlInput.addEventListener('paste', () => {
+      mapUrlInput.dataset.autogenerated = 'false';
+      mapUrlInput.dataset.manualCleared = 'false';
+      setTimeout(() => {
+        updateClearMapBtn();
+        handleMapUrlAutofill();
+      }, 80);
+    });
+  }
+
+  if (clearMapUrlBtn) {
+    clearMapUrlBtn.addEventListener('click', () => {
+      if (mapUrlInput) {
+        mapUrlInput.value = '';
+        mapUrlInput.dataset.autogenerated = 'false';
+        mapUrlInput.dataset.manualCleared = 'true';
+        mapUrlInput.focus();
+      }
+      clearMapUrlBtn.classList.add('hidden');
+      const indicator = document.getElementById('mapAutofillIndicator');
+      if (indicator) indicator.classList.add('hidden');
+    });
   }
 
   ['formName', 'formCity', 'formAddress', 'formCountry'].forEach(id => {
@@ -1611,6 +2018,146 @@ function setupEventListeners() {
     });
   }
 
+  // Modal Place Search & Autocomplete Listeners
+  const modalSearchInput = document.getElementById('modalPlaceSearchInput');
+  const modalSearchResults = document.getElementById('modalSearchResults');
+  const modalClearBtn = document.getElementById('clearModalSearchBtn');
+  const searchSpinner = document.getElementById('modalSearchSpinner');
+  const toggleMapsUrlBtn = document.getElementById('toggleMapsUrlBtn');
+  const closeMapsUrlBtn = document.getElementById('closeMapsUrlBtn');
+  const mapsUrlWrapper = document.getElementById('mapsUrlWrapper');
+  const clearSelectedPlaceBtn = document.getElementById('clearSelectedPlaceBtn');
+
+  if (toggleMapsUrlBtn && mapsUrlWrapper) {
+    toggleMapsUrlBtn.addEventListener('click', () => {
+      mapsUrlWrapper.classList.toggle('hidden');
+      if (!mapsUrlWrapper.classList.contains('hidden')) {
+        const inp = document.getElementById('formMapUrl');
+        if (inp) inp.focus();
+      }
+    });
+  }
+
+  if (closeMapsUrlBtn && mapsUrlWrapper) {
+    closeMapsUrlBtn.addEventListener('click', () => {
+      mapsUrlWrapper.classList.add('hidden');
+    });
+  }
+
+  if (clearSelectedPlaceBtn) {
+    clearSelectedPlaceBtn.addEventListener('click', () => {
+      const chipContainer = document.getElementById('selectedPlaceChipContainer');
+      if (chipContainer) chipContainer.classList.add('hidden');
+      if (modalSearchInput) {
+        modalSearchInput.value = '';
+        modalSearchInput.focus();
+      }
+    });
+  }
+
+  if (modalClearBtn) {
+    modalClearBtn.addEventListener('click', () => {
+      if (modalSearchInput) {
+        modalSearchInput.value = '';
+        modalSearchInput.focus();
+      }
+      modalClearBtn.classList.add('hidden');
+      if (modalSearchResults) {
+        modalSearchResults.classList.add('hidden');
+        modalSearchResults.innerHTML = '';
+      }
+    });
+  }
+
+  if (modalSearchInput) {
+    function checkAndHandlePastedMapUrl(rawVal) {
+      const val = (rawVal || '').trim();
+      if (val.includes('google.com/maps') || val.includes('goo.gl') || val.includes('maps.app.goo.gl')) {
+        const mapUrlInp = document.getElementById('formMapUrl');
+        if (mapUrlInp) {
+          mapUrlInp.value = val;
+          mapUrlInp.dataset.autogenerated = 'false';
+          mapUrlInp.dataset.manualCleared = 'false';
+          if (typeof updateClearMapBtn === 'function') updateClearMapBtn();
+          handleMapUrlAutofill();
+        }
+        const mapsWrap = document.getElementById('mapsUrlWrapper');
+        if (mapsWrap) mapsWrap.classList.remove('hidden');
+        modalSearchInput.value = '';
+        if (modalClearBtn) modalClearBtn.classList.add('hidden');
+        if (modalSearchResults) {
+          modalSearchResults.classList.add('hidden');
+          modalSearchResults.innerHTML = '';
+        }
+        if (searchSpinner) searchSpinner.classList.add('hidden');
+        showToast('📍 Google Maps link detected! Auto-detecting place & pin...');
+        return true;
+      }
+      return false;
+    }
+
+    modalSearchInput.addEventListener('paste', (e) => {
+      const pasted = (e.clipboardData || window.clipboardData)?.getData('text') || '';
+      if (checkAndHandlePastedMapUrl(pasted)) {
+        e.preventDefault();
+      }
+    });
+
+    modalSearchInput.addEventListener('input', (e) => {
+      const val = e.target.value.trim();
+      if (checkAndHandlePastedMapUrl(val)) return;
+
+      if (modalClearBtn) {
+        modalClearBtn.classList.toggle('hidden', val.length === 0);
+      }
+
+      if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+
+      if (val.length < 2) {
+        if (modalSearchResults) {
+          modalSearchResults.classList.add('hidden');
+          modalSearchResults.innerHTML = '';
+        }
+        if (searchSpinner) searchSpinner.classList.add('hidden');
+        return;
+      }
+
+      if (searchSpinner) searchSpinner.classList.remove('hidden');
+
+      searchDebounceTimer = setTimeout(async () => {
+        try {
+          const results = await searchPlacesOnline(val);
+          renderPlaceSearchResults(results, val);
+        } catch (err) {
+          console.error('Search error:', err);
+          renderPlaceSearchResults([], val);
+        } finally {
+          if (searchSpinner) searchSpinner.classList.add('hidden');
+        }
+      }, 280);
+    });
+
+    modalSearchInput.addEventListener('paste', () => {
+      setTimeout(() => {
+        checkAndHandlePastedMapUrl(modalSearchInput.value);
+      }, 40);
+    });
+
+    modalSearchInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        if (modalSearchResults) modalSearchResults.classList.add('hidden');
+      }
+    });
+  }
+
+  document.addEventListener('click', (e) => {
+    if (modalSearchResults && !modalSearchResults.classList.contains('hidden')) {
+      if (!modalSearchResults.contains(e.target) && e.target !== modalSearchInput) {
+        modalSearchResults.classList.add('hidden');
+      }
+    }
+  });
+
   // Share Guide Buttons
   document.getElementById('shareGuideBtn').addEventListener('click', () => openShareModal());
   document.getElementById('closeShareModalBtn').addEventListener('click', () => closeShareModal());
@@ -1621,13 +2168,70 @@ function setupEventListeners() {
   document.getElementById('printGuideBtn').addEventListener('click', () => window.print());
   document.getElementById('shareScopeSelect').addEventListener('change', updateSharePreview);
 
+  // Sync Devices Modal Listeners
+  const syncBtn = document.getElementById('syncDevicesBtn');
+  if (syncBtn) syncBtn.addEventListener('click', () => openSyncModal());
+  const closeSyncBtn = document.getElementById('closeSyncModalBtn');
+  if (closeSyncBtn) closeSyncBtn.addEventListener('click', () => closeSyncModal());
+
+  const copySyncPairBtn = document.getElementById('copySyncPairUrlBtn');
+  if (copySyncPairBtn) {
+    copySyncPairBtn.addEventListener('click', () => {
+      const input = document.getElementById('syncPairUrlInput');
+      if (input && input.value) {
+        navigator.clipboard.writeText(input.value).then(() => {
+          const lbl = document.getElementById('copySyncPairBtnLabel');
+          if (lbl) lbl.textContent = 'Copied!';
+          showToast('🔗 Pairing link copied! Send to your phone via WhatsApp or AirDrop.');
+          setTimeout(() => { if (lbl) lbl.textContent = 'Copy link'; }, 2500);
+        }).catch(() => {
+          showToast('Please select and copy the link manually.');
+        });
+      }
+    });
+  }
+
+  const manualSyncBtn = document.getElementById('manualSyncBtn');
+  if (manualSyncBtn) {
+    manualSyncBtn.addEventListener('click', async () => {
+      showToast('🔄 Syncing spots now...');
+      await pushToSync();
+      await pullFromSync(false);
+      showToast('✔ Sync completed!');
+    });
+  }
+
+  const connectSyncCodeBtn = document.getElementById('connectSyncCodeBtn');
+  if (connectSyncCodeBtn) {
+    connectSyncCodeBtn.addEventListener('click', async () => {
+      const codeInput = document.getElementById('syncCodeInput');
+      const val = (codeInput?.value || '').trim();
+      if (!val) {
+        showToast('Please enter a pairing code');
+        return;
+      }
+      let targetUri = val;
+      if (!val.startsWith('http')) {
+        targetUri = `https://api.jsonstorage.net/v1/json/${val.replace(/_/g, '/')}`;
+      }
+      syncState.vaultUri = targetUri;
+      syncState.vaultCode = val.split('/').pop().substring(0, 8).toUpperCase();
+      syncState.isLocal = false;
+      saveSyncVault();
+      showToast('✨ Connected to vault! Pulling spots...');
+      await pullFromSync(false);
+      closeSyncModal();
+    });
+  }
+
   // Close modals on clicking backdrop outside dialog
-  [document.getElementById('placeModal'), document.getElementById('shareModal')].forEach(modal => {
+  [document.getElementById('placeModal'), document.getElementById('shareModal'), document.getElementById('syncModal')].forEach(modal => {
     if (!modal) return;
     modal.addEventListener('click', (e) => {
       if (e.target === modal) {
         if (modal.id === 'placeModal') closePlaceModal();
         if (modal.id === 'shareModal') closeShareModal();
+        if (modal.id === 'syncModal') closeSyncModal();
       }
     });
   });
@@ -1644,10 +2248,13 @@ function setupEventListeners() {
     if (e.key === 'Escape') {
       const placeModal = document.getElementById('placeModal');
       const shareModal = document.getElementById('shareModal');
+      const syncModal = document.getElementById('syncModal');
       if (placeModal && !placeModal.classList.contains('hidden')) {
         closePlaceModal();
       } else if (shareModal && !shareModal.classList.contains('hidden')) {
         closeShareModal();
+      } else if (syncModal && !syncModal.classList.contains('hidden')) {
+        closeSyncModal();
       } else {
         window.closeAllCardMenus();
       }
@@ -2028,6 +2635,261 @@ function parseGoogleMapsUrl(url) {
   }
 
   return { name, city, neighbourhood, country, lat, lng };
+}
+
+// ========================================================
+// MODAL PLACE SEARCH & AUTOCOMPLETE
+// ========================================================
+let searchDebounceTimer = null;
+let currentSearchQuery = '';
+
+function detectCategoryFromOsm(props) {
+  if (!props) return null;
+  const osmKey = (props.osm_key || '').toLowerCase();
+  const osmVal = (props.osm_value || '').toLowerCase();
+
+  if (osmVal === 'cafe' || osmVal === 'bar' || osmVal === 'pub' || osmVal === 'coffee_shop' || osmVal === 'bakery') return 'cafe';
+  if (osmVal === 'restaurant' || osmVal === 'food' || osmVal === 'fast_food' || osmVal === 'food_court') return 'food';
+  if (osmKey === 'tourism' && (osmVal === 'hotel' || osmVal === 'hostel' || osmVal === 'motel' || osmVal === 'guest_house' || osmVal === 'resort')) return 'hotel';
+  if (osmKey === 'tourism' || osmKey === 'historic' || osmVal === 'attraction' || osmVal === 'museum' || osmVal === 'viewpoint' || osmVal === 'monument' || osmVal === 'beach' || osmVal === 'park') return 'sight';
+  if (osmKey === 'shop' || osmVal === 'cinema' || osmVal === 'theatre') return 'activity';
+  return null;
+}
+
+function getCategoryIconName(cat) {
+  switch (cat) {
+    case 'cafe': return 'coffee';
+    case 'food': return 'utensils';
+    case 'hotel': return 'bed';
+    case 'sight': return 'landmark';
+    case 'activity': return 'compass';
+    default: return 'map-pin';
+  }
+}
+
+async function searchPlacesOnline(query) {
+  if (!query || query.trim().length < 2) return [];
+  const cleanQ = query.trim();
+
+  // 1. Try Photon API (Fast, Free, Global POIs & Places)
+  try {
+    const res = await fetch(`https://photon.komoot.io/api/?q=${encodeURIComponent(cleanQ)}&limit=6`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data && data.features && data.features.length > 0) {
+        return data.features.map(f => {
+          const p = f.properties || {};
+          const coords = f.geometry && f.geometry.coordinates ? f.geometry.coordinates : [0, 0];
+          const name = p.name || p.street || cleanQ;
+          const city = p.city || p.town || p.district || p.state || '';
+          const country = p.country || '';
+          const address = [p.street, p.district, p.city].filter(Boolean).join(', ');
+          const cat = detectCategoryFromOsm(p);
+          return {
+            name,
+            city,
+            country,
+            address,
+            lat: coords[1],
+            lng: coords[0],
+            category: cat
+          };
+        }).filter(item => item.name && item.lat && item.lng);
+      }
+    }
+  } catch (err) {
+    // Fall back to Nominatim
+  }
+
+  // 2. Fallback: Nominatim OpenStreetMap Search
+  try {
+    const res2 = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(cleanQ)}&limit=5&addressdetails=1`, {
+      headers: { 'Accept': 'application/json' }
+    });
+    if (res2.ok) {
+      const items = await res2.json();
+      return (items || []).map(item => {
+        const addr = item.address || {};
+        const name = item.name || item.display_name.split(',')[0];
+        const city = addr.city || addr.town || addr.village || addr.suburb || addr.state || '';
+        const country = addr.country || '';
+        const road = [addr.road, addr.suburb, addr.city].filter(Boolean).join(', ');
+        return {
+          name,
+          city,
+          country,
+          address: road || item.display_name,
+          lat: parseFloat(item.lat),
+          lng: parseFloat(item.lon),
+          category: detectCategoryFromOsm(item)
+        };
+      }).filter(item => item.name && !isNaN(item.lat) && !isNaN(item.lng));
+    }
+  } catch (e) {
+    return [];
+  }
+
+  return [];
+}
+
+function renderPlaceSearchResults(results, query) {
+  const container = document.getElementById('modalSearchResults');
+  if (!container) return;
+
+  container.innerHTML = '';
+  currentSearchQuery = query;
+
+  if (results && results.length > 0) {
+    results.forEach((item) => {
+      const row = document.createElement('div');
+      row.className = 'search-result-item';
+      row.tabIndex = 0;
+      const icon = getCategoryIconName(item.category);
+      const detail = [item.address, item.city, item.country].filter(Boolean).join(' • ');
+
+      row.innerHTML = `
+        <div class="search-item-icon-box">
+          <i data-lucide="${icon}" style="width: 16px; height: 16px;"></i>
+        </div>
+        <div class="search-item-info">
+          <span class="search-item-title">${escapeHtml(item.name)}</span>
+          <span class="search-item-desc">${escapeHtml(detail)}</span>
+        </div>
+        ${item.category ? `<span class="search-item-badge">${escapeHtml(item.category)}</span>` : ''}
+      `;
+
+      row.addEventListener('click', () => selectSearchResult(item));
+      row.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          selectSearchResult(item);
+        }
+      });
+      container.appendChild(row);
+    });
+  } else {
+    // Zero results notice
+    const emptyRow = document.createElement('div');
+    emptyRow.style.padding = '0.75rem 1rem';
+    emptyRow.style.fontSize = '0.8rem';
+    emptyRow.style.color = 'var(--stone-500)';
+    emptyRow.style.textAlign = 'center';
+    emptyRow.textContent = 'No matching places found on map';
+    container.appendChild(emptyRow);
+  }
+
+  // ALWAYS append: "Add as custom place" action card!
+  const customRow = document.createElement('div');
+  customRow.className = 'search-result-item search-result-custom';
+  customRow.tabIndex = 0;
+  customRow.innerHTML = `
+    <div class="search-item-icon-box custom-icon-box">
+      <i data-lucide="plus" style="width: 16px; height: 16px;"></i>
+    </div>
+    <div class="search-item-info">
+      <span class="search-item-title">Add "<strong>${escapeHtml(query)}</strong>" as custom place</span>
+      <span class="search-item-desc">Not on map? Add custom place with manual details</span>
+    </div>
+    <span class="search-item-badge custom-badge">Custom</span>
+  `;
+  customRow.addEventListener('click', () => selectCustomPlaceFallback(query));
+  customRow.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      selectCustomPlaceFallback(query);
+    }
+  });
+  container.appendChild(customRow);
+
+  container.classList.remove('hidden');
+  if (window.lucide) lucide.createIcons();
+}
+
+function selectSearchResult(item) {
+  const nameInput = document.getElementById('formName');
+  const cityInput = document.getElementById('formCity');
+  const countryInput = document.getElementById('formCountry');
+  const addressInput = document.getElementById('formAddress');
+  const latInput = document.getElementById('formLat');
+  const lngInput = document.getElementById('formLng');
+  const catInput = document.getElementById('formCategory');
+  const searchInput = document.getElementById('modalPlaceSearchInput');
+  const searchResults = document.getElementById('modalSearchResults');
+  const chipContainer = document.getElementById('selectedPlaceChipContainer');
+  const chipText = document.getElementById('selectedPlaceChipText');
+
+  if (nameInput) { nameInput.value = item.name; nameInput.dataset.autofilled = 'true'; }
+  if (cityInput && item.city) { cityInput.value = item.city; cityInput.dataset.autofilled = 'true'; }
+  if (countryInput && item.country) { countryInput.value = item.country; countryInput.dataset.autofilled = 'true'; }
+  if (addressInput && item.address) { addressInput.value = item.address; addressInput.dataset.autofilled = 'true'; }
+  if (latInput && item.lat) latInput.value = item.lat;
+  if (lngInput && item.lng) lngInput.value = item.lng;
+  if (catInput && item.category) catInput.value = item.category;
+
+  // Auto-generate Google Maps link for the selected place
+  const mapUrlInput = document.getElementById('formMapUrl');
+  const clearMapBtn = document.getElementById('clearMapUrlBtn');
+  const indicator = document.getElementById('mapAutofillIndicator');
+  const generatedMapUrl = (item.lat && item.lng)
+    ? `https://www.google.com/maps/search/?api=1&query=${item.lat},${item.lng}`
+    : `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(item.name + (item.city ? ', ' + item.city : ''))}`;
+  if (mapUrlInput) {
+    mapUrlInput.value = generatedMapUrl;
+    if (clearMapBtn) clearMapBtn.classList.remove('hidden');
+    if (indicator) indicator.classList.remove('hidden');
+  }
+
+  if (chipContainer && chipText) {
+    chipText.textContent = `📍 ${item.name}${item.city ? ` (${item.city})` : ''}`;
+    chipContainer.classList.remove('hidden');
+  }
+
+  if (searchResults) searchResults.classList.add('hidden');
+  if (searchInput) searchInput.value = '';
+  const clearBtn = document.getElementById('clearModalSearchBtn');
+  if (clearBtn) clearBtn.classList.add('hidden');
+
+  showToast(`📍 Found on map: ${item.name}`);
+  if (window.lucide) lucide.createIcons();
+}
+
+function selectCustomPlaceFallback(query) {
+  const nameInput = document.getElementById('formName');
+  const cityInput = document.getElementById('formCity');
+  const searchInput = document.getElementById('modalPlaceSearchInput');
+  const searchResults = document.getElementById('modalSearchResults');
+  const chipContainer = document.getElementById('selectedPlaceChipContainer');
+  const chipText = document.getElementById('selectedPlaceChipText');
+
+  if (nameInput) {
+    nameInput.value = query;
+    nameInput.dataset.autofilled = 'true';
+  }
+
+  // Pre-fill a search link for custom place
+  const mapUrlInput = document.getElementById('formMapUrl');
+  const clearMapBtn = document.getElementById('clearMapUrlBtn');
+  if (mapUrlInput && !mapUrlInput.value) {
+    mapUrlInput.value = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(query)}`;
+    if (clearMapBtn) clearMapBtn.classList.remove('hidden');
+  }
+
+  if (chipContainer && chipText) {
+    chipText.textContent = `✨ Custom Place: ${query}`;
+    chipContainer.classList.remove('hidden');
+  }
+
+  if (searchResults) searchResults.classList.add('hidden');
+  if (searchInput) searchInput.value = '';
+  const clearBtn = document.getElementById('clearModalSearchBtn');
+  if (clearBtn) clearBtn.classList.add('hidden');
+
+  if (cityInput && !cityInput.value) {
+    cityInput.focus();
+  }
+
+  showToast(`✨ Adding "${query}" as custom place. Enter details below!`);
+  if (window.lucide) lucide.createIcons();
 }
 
 async function handleMapUrlAutofill() {
@@ -2459,13 +3321,41 @@ function openPlaceModal(place = null) {
   const indicator = document.getElementById('mapAutofillIndicator');
   if (indicator) indicator.classList.add('hidden');
 
+  // Reset Place Search & Autocomplete
+  const modalSearchInput = document.getElementById('modalPlaceSearchInput');
+  if (modalSearchInput) modalSearchInput.value = '';
+  const searchResults = document.getElementById('modalSearchResults');
+  if (searchResults) { searchResults.classList.add('hidden'); searchResults.innerHTML = ''; }
+  const clearSearchBtn = document.getElementById('clearModalSearchBtn');
+  if (clearSearchBtn) clearSearchBtn.classList.add('hidden');
+  const searchSpinner = document.getElementById('modalSearchSpinner');
+  if (searchSpinner) searchSpinner.classList.add('hidden');
+  const chipContainer = document.getElementById('selectedPlaceChipContainer');
+  if (chipContainer) chipContainer.classList.add('hidden');
+  const mapsWrapper = document.getElementById('mapsUrlWrapper');
+  if (mapsWrapper) mapsWrapper.classList.remove('hidden');
+  const clearMapBtn = document.getElementById('clearMapUrlBtn');
+
   const isVisited = place ? (place.visited !== false) : true;
   setVisitStatus(isVisited);
 
   if (place) {
+    if (chipContainer && place.name) {
+      const chipText = document.getElementById('selectedPlaceChipText');
+      if (chipText) chipText.textContent = `📍 ${place.name}${place.city ? ` (${place.city})` : ''}`;
+      chipContainer.classList.remove('hidden');
+    }
     heading.textContent = 'Edit place';
     document.getElementById('placeId').value = place.id;
-    document.getElementById('formMapUrl').value = place.mapUrl || '';
+    const existingMapUrl = place.mapUrl || getPlaceMapUrl(place) || '';
+    const mapUrlInp = document.getElementById('formMapUrl');
+    if (mapUrlInp) {
+      mapUrlInp.value = existingMapUrl;
+      mapUrlInp.dataset.autogenerated = 'false';
+      mapUrlInp.dataset.manualCleared = 'false';
+    }
+    if (clearMapBtn) clearMapBtn.classList.toggle('hidden', !existingMapUrl);
+    if (indicator) indicator.classList.toggle('hidden', !existingMapUrl);
     document.getElementById('formName').value = place.name || '';
     document.getElementById('formCity').value = place.city || '';
     document.getElementById('formCountry').value = place.country || 'India';
@@ -2495,7 +3385,14 @@ function openPlaceModal(place = null) {
   } else {
     heading.textContent = 'Add new place';
     document.getElementById('placeId').value = '';
-    document.getElementById('formMapUrl').value = '';
+    const mapUrlInp = document.getElementById('formMapUrl');
+    if (mapUrlInp) {
+      mapUrlInp.value = '';
+      mapUrlInp.dataset.autogenerated = 'false';
+      mapUrlInp.dataset.manualCleared = 'false';
+    }
+    if (clearMapBtn) clearMapBtn.classList.add('hidden');
+    if (indicator) indicator.classList.add('hidden');
     document.getElementById('formName').value = '';
     document.getElementById('formName').dataset.autofilled = 'false';
     document.getElementById('formCity').dataset.autofilled = 'false';
@@ -2556,7 +3453,7 @@ function closePlaceModal() {
   onModalClose();
 }
 
-function handlePlaceFormSubmit(e) {
+async function handlePlaceFormSubmit(e) {
   e.preventDefault();
 
   try {
@@ -2615,14 +3512,35 @@ function handlePlaceFormSubmit(e) {
     const rating = isVisited ? (STAR_RATING_KEYS[stars] || 'must_visit') : '';
 
     if (isNaN(lat) || isNaN(lng) || lat === 0) {
-      const existingWithCoords = state.places.find(p => p.city.toLowerCase() === city.toLowerCase() && typeof p.lat === 'number');
+      const existingWithCoords = state.places.find(p => p.city && p.city.toLowerCase() === city.toLowerCase() && typeof p.lat === 'number' && p.lat !== 0);
       if (existingWithCoords) {
-        lat = existingWithCoords.lat + (Math.random() - 0.5) * 0.02;
-        lng = existingWithCoords.lng + (Math.random() - 0.5) * 0.02;
+        lat = existingWithCoords.lat + (Math.random() - 0.5) * 0.015;
+        lng = existingWithCoords.lng + (Math.random() - 0.5) * 0.015;
       } else {
-        lat = 0;
-        lng = 0;
+        // Automatically geocode the City & Country so custom places drop a pin accurately
+        try {
+          const geoRes = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(city + ', ' + country)}&limit=1`, {
+            headers: { 'Accept': 'application/json' }
+          });
+          if (geoRes.ok) {
+            const geoData = await geoRes.json();
+            if (geoData && geoData.length > 0) {
+              lat = parseFloat(geoData[0].lat) + (Math.random() - 0.5) * 0.012;
+              lng = parseFloat(geoData[0].lon) + (Math.random() - 0.5) * 0.012;
+            }
+          }
+        } catch (e) {
+          // Ignore network failure
+        }
+        if (isNaN(lat) || isNaN(lng) || lat === 0) {
+          lat = 20.5937; // Center of India fallback
+          lng = 78.9629;
+        }
       }
+    }
+
+    if (!mapUrl) {
+      mapUrl = getPlaceMapUrl({ name, city, country, lat, lng });
     }
 
     const existingIndex = state.places.findIndex(p => p.id === id);
@@ -2643,7 +3561,8 @@ function handlePlaceFormSubmit(e) {
       photoUrl,
       photoSource,
       notes,
-      createdAt: existingIndex >= 0 ? state.places[existingIndex].createdAt : Date.now()
+      createdAt: existingIndex >= 0 ? state.places[existingIndex].createdAt : Date.now(),
+      updatedAt: Date.now()
     };
 
     if (existingIndex >= 0) {
@@ -2896,8 +3815,9 @@ function generateShareText() {
       if (p.notes) {
         text += `   📝 Note: ${p.notes}\n`;
       }
-      if (p.mapUrl) {
-        text += `   🔗 Maps: ${p.mapUrl}\n`;
+      const placeMapLink = getPlaceMapUrl(p);
+      if (placeMapLink) {
+        text += `   🔗 Maps: ${placeMapLink}\n`;
       }
       text += `\n`;
     });
@@ -2961,7 +3881,8 @@ window.shareSinglePlace = function(id) {
   msg += `${catMeta.emoji} *${place.name}* ${statusLabel}\n`;
   if (place.address) msg += `📍 ${place.address}, ${place.city}\n`;
   if (place.notes) msg += `📝 ${place.notes}\n`;
-  if (place.mapUrl) msg += `🔗 Maps: ${place.mapUrl}\n`;
+  const singleMapLink = getPlaceMapUrl(place);
+  if (singleMapLink) msg += `🔗 Maps: ${singleMapLink}\n`;
 
   const encoded = encodeURIComponent(msg);
   window.open(`https://api.whatsapp.com/send?text=${encoded}`, '_blank');
