@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#0e5c63"/>
+      <stop offset="100%" stop-color="#0b282c"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="12" stdDeviation="16" flood-color="#000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+  
+  <!-- Rounded Squircle Background -->
+  <rect width="512" height="512" rx="112" fill="url(#bgGrad)"/>
+  
+  <!-- Travel Pin -->
+  <g filter="url(#shadow)">
+    <!-- Pin Body (White) -->
+    <path d="M256,110 C195.25,110 146,159.25 146,220 C146,290 256,400 256,400 C256,400 366,290 366,220 C366,159.25 316.75,110 256,110 Z" fill="#ffffff"/>
+    
+    <!-- Pin Inner Dot (Brand Mint) -->
+    <circle cx="256" cy="220" r="42" fill="#2dd4bf"/>
+  </g>
+  
+  <!-- Sparkle Star in Amber -->
+  <path d="M380,120 L386,134 L400,140 L386,146 L380,160 L374,146 L360,140 L374,134 Z" fill="#fbbf24"/>
+</svg>
